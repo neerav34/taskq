@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: taskq-api
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn api.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /healthz
+    envVars:
+      - key: TASKQ_REDIS_URL
+        sync: false  # set in the Render dashboard: the Upstash rediss:// URL
+      - key: TASKQ_KEY_PREFIX
+        value: "taskq:"  # namespace — the Upstash DB is shared with another app

@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>taskq dashboard</title>
+<style>
+  :root {
+    --bg: #f7f7f8; --surface: #ffffff; --border: #e4e4e7;
+    --ink: #1c1c21; --ink-2: #55555e; --ink-3: #8b8b94;
+    --accent: #3d6de0; --accent-soft: #e3eafc;
+    --good: #1a7f37; --bad: #b3261e; --bad-soft: #fdeceb;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #131316; --surface: #1d1d22; --border: #313138;
+      --ink: #ececf0; --ink-2: #b3b3bc; --ink-3: #7c7c86;
+      --accent: #7da2f2; --accent-soft: #26334f;
+      --good: #4fc06d; --bad: #f28d86; --bad-soft: #3d2422;
+    }
+  }
+  * { box-sizing: border-box; margin: 0; }
+  body {
+    font: 14px/1.5 -apple-system, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg); color: var(--ink); padding: 24px; max-width: 960px; margin: 0 auto;
+  }
+  header { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 20px; }
+  h1 { font-size: 18px; font-weight: 650; }
+  #meta { color: var(--ink-3); font-size: 12px; }
+  #meta .down { color: var(--bad); font-weight: 600; }
+  h2 { font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em;
+       color: var(--ink-2); margin: 24px 0 10px; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+  .tile { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+  .tile .num { font-size: 28px; font-weight: 650; font-variant-numeric: tabular-nums; }
+  .tile .lbl { color: var(--ink-2); font-size: 12px; margin-top: 2px; }
+  .tile.alert .num { color: var(--bad); }
+  .qrow { display: grid; grid-template-columns: 64px 1fr 90px; gap: 10px; align-items: center; margin: 8px 0; }
+  .qname { color: var(--ink-2); font-size: 13px; }
+  .track { background: var(--accent-soft); border-radius: 4px; height: 14px; overflow: hidden; }
+  .fill { background: var(--accent); height: 100%; border-radius: 4px 4px 4px 4px; min-width: 2px; transition: width .4s; }
+  .fill.empty { min-width: 0; width: 0; }
+  .qval { font-variant-numeric: tabular-nums; color: var(--ink-2); font-size: 12px; text-align: right; }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+  table { width: 100%; border-collapse: collapse; }
+  th { text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: .05em;
+       color: var(--ink-3); font-weight: 600; padding: 4px 10px 8px 0; }
+  td { padding: 6px 10px 6px 0; border-top: 1px solid var(--border); font-size: 13px; vertical-align: top; }
+  td.mono, .mono { font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
+  .pill { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; font-weight: 600; }
+  .pill .dot { width: 7px; height: 7px; border-radius: 50%; }
+  .pill.alive { color: var(--good); } .pill.alive .dot { background: var(--good); }
+  .err { color: var(--ink-2); max-width: 340px; overflow: hidden; text-overflow: ellipsis;
+         white-space: nowrap; display: inline-block; }
+  .empty-note { color: var(--ink-3); padding: 10px 0 4px; font-size: 13px; }
+  .deadrow td:first-child { color: var(--bad); font-weight: 600; }
+</style>
+</head>
+<body>
+<header>
+  <h1>taskq</h1>
+  <div id="meta">connecting…</div>
+</header>
+
+<div class="tiles" id="tiles"></div>
+
+<h2>Queue depth</h2>
+<div class="card" id="queues"></div>
+
+<h2>Workers</h2>
+<div class="card" id="workers"></div>
+
+<h2>Recent dead-letter jobs</h2>
+<div class="card" id="dlq"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+function ago(iso) {
+  if (!iso) return "–";
+  const s = Math.max(0, (Date.now() - new Date(iso)) / 1000);
+  if (s < 60) return Math.round(s) + "s ago";
+  if (s < 3600) return Math.round(s / 60) + "m ago";
+  return Math.round(s / 3600) + "h ago";
+}
+
+function render(d) {
+  const totalQueued = Object.values(d.queues).reduce((a, b) => a + b, 0);
+  $("tiles").innerHTML = [
+    { n: totalQueued, l: "queued" },
+    { n: d.processing, l: "processing" },
+    { n: d.scheduled_retries, l: "scheduled retries" },
+    { n: d.dead_letter_count, l: "dead-letter", alert: d.dead_letter_count > 0 },
+  ].map(t => `<div class="tile${t.alert ? " alert" : ""}">
+      <div class="num">${t.n}</div><div class="lbl">${t.l}</div></div>`).join("");
+
+  $("queues").innerHTML = Object.entries(d.queues).map(([name, depth]) => {
+    const pct = Math.min(100, depth / d.max_queue_depth * 100);
+    return `<div class="qrow"><span class="qname">${name}</span>
+      <div class="track"><div class="fill${depth === 0 ? " empty" : ""}" style="width:${pct}%"></div></div>
+      <span class="qval">${depth} / ${d.max_queue_depth}</span></div>`;
+  }).join("");
+
+  $("workers").innerHTML = d.workers.length === 0
+    ? `<div class="empty-note">No live workers — heartbeat keys have all expired.</div>`
+    : `<table><tr><th>worker</th><th>status</th><th>last heartbeat</th></tr>` +
+      d.workers.map(w => `<tr>
+        <td class="mono">${esc(w.id)}</td>
+        <td><span class="pill alive"><span class="dot"></span>alive</span></td>
+        <td>${ago(w.last_heartbeat)}</td></tr>`).join("") + "</table>";
+
+  $("dlq").innerHTML = d.recent_dead_letter.length === 0
+    ? `<div class="empty-note">Dead-letter queue is empty.</div>`
+    : `<table><tr><th>job</th><th>task</th><th>attempts</th><th>error</th><th>when</th></tr>` +
+      d.recent_dead_letter.map(j => `<tr class="deadrow">
+        <td class="mono">${esc((j.id || "").slice(0, 8))}</td>
+        <td>${esc(j.task)}</td>
+        <td>${esc(j.attempts)}</td>
+        <td><span class="err" title="${esc(j.error)}">${esc(j.error)}</span></td>
+        <td>${ago(j.updated_at)}</td></tr>`).join("") + "</table>";
+}
+
+async function tick() {
+  try {
+    const res = await fetch("/stats");
+    render(await res.json());
+    $("meta").textContent = "live · updated " + new Date().toLocaleTimeString();
+  } catch {
+    $("meta").innerHTML = `<span class="down">✕ API unreachable</span>`;
+  }
+}
+tick();
+setInterval(tick, 2000);
+</script>
+</body>
+</html>
