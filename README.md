@@ -11,6 +11,11 @@ are all failure handling: What if a worker dies holding a job? What if the same
 job gets submitted twice? What if a job fails — forever? What if producers
 outrun consumers? taskq implements a real answer to each.
 
+**Live:** [API](https://taskq-api-8orl.onrender.com/docs) ·
+[Dashboard](https://taskq-api-8orl.onrender.com/dashboard) — free-tier
+hosting sleeps after 15 min idle, so the first request may take ~30s. Demo
+video: _coming soon_.
+
 ## Features
 
 - **Priority scheduling** — three queues (`high` / `normal` / `low`); a high
@@ -87,6 +92,42 @@ kill-a-worker demo): [TESTING.md](TESTING.md)
 
 Job statuses: `queued → running → done`, or `running → retrying → queued →
 … → dead` on repeated failure.
+
+## Tasks & writing your own handler
+
+A job's `task` field names a Python function in the worker's registry
+([worker/handlers.py](worker/handlers.py)). Built-ins: `send_welcome` and
+`resize_image` (simulate slow I/O), `noop` (instant — used by the load test),
+`long_task` (seconds of visible progress — used for the kill-a-worker demo),
+`always_fail` (used to demo retries/dead-letter). A job naming an unregistered
+task fails cleanly with `no handler registered`.
+
+Adding your own is a function plus a registry entry:
+
+```python
+def send_invoice(payload):
+    # payload is the JSON object the producer enqueued
+    ...
+    return {"invoiced": payload["order_id"]}   # stored as the job's result
+
+HANDLERS = {..., "send_invoice": send_invoice}
+```
+
+Because delivery is at-least-once (see below), handlers should be idempotent —
+safe to run twice for the same payload.
+
+## Configuration
+
+All via environment variables, all optional:
+
+| Variable | Default | What it controls |
+|---|---|---|
+| `TASKQ_REDIS_URL` | `redis://localhost:6379/0` | Redis connection (use `rediss://` for TLS) |
+| `TASKQ_KEY_PREFIX` | *(empty)* | Namespace for every key, e.g. `taskq:` — lets taskq share a Redis DB with another app; API and workers must match |
+| `TASKQ_LEASE_TTL` | `30` | Seconds before an unrefreshed job lease expires (worker presumed dead) |
+| `TASKQ_HEARTBEAT` | `10` | Seconds between lease/liveness refreshes |
+| `TASKQ_MAX_QUEUE_DEPTH` | `1000` | Per-queue cap before `/enqueue` returns 503 |
+| `TASKQ_IDEMPOTENCY_TTL` | `86400` | Seconds an idempotency key blocks duplicates |
 
 ## How the failure handling works
 
@@ -174,10 +215,30 @@ workers, 500 `noop` jobs @ concurrency 20, warmed up):
 First-run (cold thread pool) p99 was ~516 ms — warmup excluded from the
 steady-state numbers above, noted here for honesty.
 
-**Deployed** (Render free tier + Upstash): _not yet measured — this section
-gets real numbers after deployment, accounting for Render's free-tier cold
-start (~30s after 15 min idle; the load test is run against a warmed
-instance and cold-start latency is reported separately, not averaged in)._
+**Deployed** (Render free tier + Upstash free tier, shared database; 200
+`noop` jobs @ concurrency 10, warmed instance, client on a home connection in
+India):
+
+| Metric | Value |
+|---|---|
+| Accepted | 200/200 (zero errors) |
+| Enqueue throughput | 10.3 req/s (concurrency-bound: ~10 in flight × ~750 ms each) |
+| Enqueue latency p50 | 751 ms |
+| Enqueue latency p90 | 1004 ms |
+| Enqueue latency p99 | 4476 ms |
+| End-to-end drain | ~4.9 jobs/s (2 workers running on a laptop) |
+
+What these numbers actually measure: geography, mostly. Each request crosses
+client → Render, then the API makes two Redis round trips to Upstash (depth
+check + write pipeline). The p99 tail is dominated by the ten initial TLS
+handshakes. Workers ran on a laptop, so every job cost ~8 laptop↔Upstash
+round trips — colocating workers and Redis in one region is the obvious
+production fix and would change these numbers dramatically (compare the local
+baseline above, where the same code does ~520 req/s). Test size (200 jobs) was
+deliberately small: the Redis database is a shared free tier with a command
+budget. Render free-tier cold start after 15 min idle adds ~30s to the first
+request (per Render's documentation); load tests were run warmed, never
+averaging cold starts into latency numbers.
 
 ## Deployment (all free tiers)
 
